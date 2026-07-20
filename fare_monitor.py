@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check error/mistake-fare RSS feeds and post qualifying deals to Slack."""
 
+import argparse
 import json
 import re
 import sys
@@ -83,6 +84,11 @@ def send_slack_message(webhook_url: str, qualifying: list[dict]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verbose", action="store_true",
+                         help="Print every fetched item (title, pubDate, in-window?, matched?) for debugging")
+    args = parser.parse_args()
+
     webhook_url = load_webhook_url()
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=LOOKBACK_HOURS)
@@ -94,8 +100,17 @@ def main() -> None:
         except (requests.RequestException, ET.ParseError) as exc:
             print(f"[{now.isoformat()}] Failed to fetch {site}: {exc}", file=sys.stderr)
             continue
-        recent = [i for i in items if i["pub_date"] >= cutoff]
-        qualifying.extend(i for i in recent if is_error_fare(i))
+        if args.verbose:
+            print(f"-- {site}: fetched {len(items)} item(s) --")
+        for i in items:
+            in_window = i["pub_date"] >= cutoff
+            matched = is_error_fare(i) if in_window else False
+            if args.verbose:
+                print(f"  [{'IN' if in_window else 'old'}] "
+                      f"[{'MATCH' if matched else '  no  '}] "
+                      f"{i['pub_date'].strftime('%Y-%m-%d %H:%M UTC')}  {i['title']}")
+            if in_window and matched:
+                qualifying.append(i)
 
     if qualifying:
         qualifying.sort(key=lambda i: i["pub_date"], reverse=True)
