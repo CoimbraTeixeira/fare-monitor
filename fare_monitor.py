@@ -27,9 +27,14 @@ SEEN_RETENTION_DAYS = 30
 FETCH_ATTEMPTS = 3
 FETCH_BACKOFF_SECONDS = 3
 
+# Deal-posting feeds only. General points/miles blogs (TPG, One Mile at a
+# Time, Thrifty Traveler) are deliberately excluded: they publish commentary
+# *about* error fares ("anatomy of a mistake fare"), which matches the
+# patterns but is never a bookable deal.
 FEEDS = {
     "The Flight Deal": "https://www.theflightdeal.com/feed/",
     "Fly4Free": "https://www.fly4free.com/feed/",
+    "Fare Deal Alert": "https://faredealalert.com/feed/",
 }
 
 ERROR_FARE_PATTERNS = [
