@@ -35,6 +35,7 @@ FEEDS = {
     "The Flight Deal": "https://www.theflightdeal.com/feed/",
     "Fly4Free": "https://www.fly4free.com/feed/",
     "Fare Deal Alert": "https://faredealalert.com/feed/",
+    "Travelfree": "https://travelfree.info/feed/",
 }
 
 ERROR_FARE_PATTERNS = [
