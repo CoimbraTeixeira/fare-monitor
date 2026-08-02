@@ -87,6 +87,23 @@ class MatchingTests(unittest.TestCase):
             with self.subTest(title=title):
                 self.assertFalse(fm.is_error_fare(make_item(title, "A good sale")))
 
+    def test_matches_real_historical_error_fares(self):
+        """Titles of actual error-fare posts from The Flight Deal's archive.
+
+        These are the ground truth for the whole script. The site labels such
+        posts in the title, which the feed carries in full -- so the truncated
+        "Read More" excerpt is not a detection gap, and there is no need to
+        fetch article bodies. If a pattern change breaks these, the monitor
+        has stopped doing its only job.
+        """
+        for title in [
+            "Mistake Fare Alert: United. Seattle - Beijing, China. $405! Round trip. All in.",
+            "Mistake Fare - Delta: Newark - San Pedro, Honduras. As low as $206. Roundtrip.",
+            "Mistake Fare Alert! Swiss Air: Los Angeles/San Francisco - Zurich. $568. Roundtrip.",
+        ]:
+            with self.subTest(title=title):
+                self.assertTrue(fm.is_error_fare(make_item(title)))
+
 
 class CleanTextTests(unittest.TestCase):
     def test_strips_tags(self):
