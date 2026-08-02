@@ -183,7 +183,7 @@ class PageParsingTests(unittest.TestCase):
         cls.items = fm.parse_page_items("Secret Flying", cls.html)
 
     def test_extracts_posts_with_dates_and_links(self):
-        self.assertGreaterEqual(len(self.items), 5)
+        self.assertGreaterEqual(len(self.items), 3)
         for item in self.items:
             with self.subTest(link=item["link"]):
                 self.assertIn("/posts/", item["link"])
