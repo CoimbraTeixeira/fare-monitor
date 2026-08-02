@@ -10,6 +10,7 @@ the Slack webhook are stubbed, and state is written to a temp directory.
 
 import io
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -172,6 +173,61 @@ class FetchItemsTests(unittest.TestCase):
         self.assertEqual(self.fetch(feed_bytes(xml))[0]["id"], "https://example.com/1")
 
 
+class PageParsingTests(unittest.TestCase):
+    """Secret Flying is read from HTML: its feed and category pages are 403."""
+
+    @classmethod
+    def setUpClass(cls):
+        fixture = Path(__file__).parent / "testdata" / "secretflying_home.html"
+        cls.html = fixture.read_text()
+        cls.items = fm.parse_page_items("Secret Flying", cls.html)
+
+    def test_extracts_posts_with_dates_and_links(self):
+        self.assertGreaterEqual(len(self.items), 5)
+        for item in self.items:
+            with self.subTest(link=item["link"]):
+                self.assertIn("/posts/", item["link"])
+                self.assertIsNotNone(item["pub_date"].tzinfo)
+
+    def test_deduplicates_repeated_links(self):
+        links = [i["link"] for i in self.items]
+        self.assertEqual(len(links), len(set(links)))
+
+    def test_prefers_readable_title_over_slug(self):
+        """Titles carry emoji and capitalisation; slugs are hyphenated lowercase."""
+        titled = [i for i in self.items if "ERROR FARE" in i["title"]]
+        self.assertTrue(titled, "fixture should contain a labelled error fare")
+        self.assertNotIn("-", titled[0]["title"].split()[0])
+
+    def test_title_is_never_a_bare_date(self):
+        for item in self.items:
+            with self.subTest(title=item["title"]):
+                self.assertIsNone(fm.DATE_LABEL_RE.match(item["title"]))
+
+    def test_detects_the_labelled_error_fare(self):
+        matched = [i for i in self.items if fm.is_error_fare(i)]
+        self.assertTrue(matched, "the 'ERROR FARE' post must be detected")
+
+    def test_matches_via_slug_when_title_extraction_fails(self):
+        """Markup can change; the URL slug is the durable signal."""
+        # Blank out plain-text anchor content (the titles) while leaving nested
+        # markup alone, so <time datetime=...> inside the date link survives.
+        stripped = re.sub(r"(<a[^>]*>)([^<]{12,})(</a>)", r"\1\3", self.html)
+        items = fm.parse_page_items("Secret Flying", stripped)
+        self.assertTrue(items, "structure should still parse without title text")
+        self.assertTrue([i for i in items if fm.is_error_fare(i)])
+
+    def test_warns_when_extraction_yields_nothing(self):
+        """A layout change must not look like a quiet day."""
+        err = io.StringIO()
+        empty = type("R", (), {"text": "<html><body>no articles</body></html>"})()
+        with mock.patch.object(fm, "http_get", lambda url: empty), \
+                mock.patch.object(sys, "stderr", err):
+            items = fm.fetch_page_items("Secret Flying", "https://example.com/")
+        self.assertEqual(items, [])
+        self.assertIn("0 posts", err.getvalue())
+
+
 class RetryTests(unittest.TestCase):
     def setUp(self):
         patcher = mock.patch.object(fm, "FETCH_BACKOFF_SECONDS", 0)
@@ -217,6 +273,7 @@ class MainFlowTests(unittest.TestCase):
             ("CONFIG_DIR", self.tmp),
             ("SEEN_PATH", self.tmp / "seen.json"),
             ("FEEDS", {"Test Site": "https://feed"}),
+            ("PAGES", {}),  # keep main() offline; HTML sources covered separately
             ("load_webhook_url", lambda: "https://hook"),
         ]:
             patcher = mock.patch.object(fm, target, value)

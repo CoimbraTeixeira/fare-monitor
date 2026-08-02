@@ -38,6 +38,23 @@ FEEDS = {
     "Travelfree": "https://travelfree.info/feed/",
 }
 
+# Sites with no usable feed, read from HTML instead. Secret Flying is the only
+# source here that labels error fares explicitly ("ERROR FARE" in the title),
+# but Cloudflare 403s its /feed/ and category pages; the homepage is served
+# normally, and their robots.txt allows crawling at Crawl-delay: 1. One request
+# every 6h is well inside that.
+PAGES = {
+    "Secret Flying": "https://www.secretflying.com/",
+}
+
+ARTICLE_RE = re.compile(r"<article.*?</article>", re.DOTALL)
+POST_LINK_RE = re.compile(r'href="(https://www\.secretflying\.com/posts/[^"]+)"')
+DATETIME_RE = re.compile(r'datetime="([^"]+)"')
+ANCHOR_RE = re.compile(
+    r'<a[^>]*href="https://www\.secretflying\.com/posts/[^"]*"[^>]*>(.*?)</a>', re.DOTALL
+)
+DATE_LABEL_RE = re.compile(r"^[A-Z][a-z]+ \d{1,2}, \d{4}$")
+
 ERROR_FARE_PATTERNS = [
     r"error fare", r"mistake fare", r"pricing error", r"pricing glitch",
     r"glitch fare", r"fare glitch", r"may not be honou?red",
@@ -94,22 +111,75 @@ def clean_text(raw: str) -> str:
     return WHITESPACE_RE.sub(" ", unescape(TAG_RE.sub(" ", raw))).strip()
 
 
-def fetch_items(site: str, feed_url: str) -> list[dict]:
+def http_get(url: str) -> requests.Response:
+    """GET with retries. Raises the last error if every attempt fails."""
     last_exc: Exception | None = None
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         try:
-            resp = requests.get(feed_url, timeout=15,
+            resp = requests.get(url, timeout=15,
                                 headers={"User-Agent": "fare-monitor/1.0"})
             resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            break
-        except (requests.RequestException, ET.ParseError) as exc:
+            return resp
+        except requests.RequestException as exc:
             last_exc = exc
             if attempt < FETCH_ATTEMPTS:
                 time.sleep(FETCH_BACKOFF_SECONDS * attempt)
-    else:
-        raise last_exc  # type: ignore[misc]
+    raise last_exc  # type: ignore[misc]
 
+
+def parse_page_items(site: str, html: str) -> list[dict]:
+    """Extract posts from a Secret Flying-style listing page.
+
+    The title is taken from the post's anchor text, but matching also runs
+    against the URL slug ("...posts/error-fare-business-class-..."), which
+    survives markup changes that would break title extraction.
+    """
+    items, seen_links = [], set()
+    for block in ARTICLE_RE.findall(html):
+        link_match = POST_LINK_RE.search(block)
+        date_match = DATETIME_RE.search(block)
+        if not (link_match and date_match):
+            continue
+        link = link_match.group(1)
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+
+        try:
+            pub_date = datetime.fromisoformat(date_match.group(1).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if pub_date.tzinfo is None:
+            pub_date = pub_date.replace(tzinfo=timezone.utc)
+
+        slug_words = link.rstrip("/").rsplit("/", 1)[-1].replace("-", " ")
+        candidates = [clean_text(a) for a in ANCHOR_RE.findall(block)]
+        candidates = [c for c in candidates if len(c) > 12 and not DATE_LABEL_RE.match(c)]
+        title = max(candidates, key=len) if candidates else slug_words
+
+        items.append({
+            "site": site,
+            "title": title,
+            "link": link,
+            "pub_date": pub_date,
+            "description": slug_words,
+            "categories": [],
+            "id": link,
+        })
+    return items
+
+
+def fetch_page_items(site: str, page_url: str) -> list[dict]:
+    items = parse_page_items(site, http_get(page_url).text)
+    if not items:
+        # Silent breakage would look identical to a quiet day in the log.
+        print(f"Warning: extracted 0 posts from {page_url} -- page layout may have changed",
+              file=sys.stderr)
+    return items
+
+
+def fetch_items(site: str, feed_url: str) -> list[dict]:
+    root = ET.fromstring(http_get(feed_url).content)
     items = []
     for item in root.findall("./channel/item"):
         title = clean_text(item.findtext("title") or "")
@@ -171,10 +241,13 @@ def main() -> None:
     cutoff = now - timedelta(hours=LOOKBACK_HOURS)
     seen = load_seen()
 
+    sources = [(site, url, fetch_items) for site, url in FEEDS.items()]
+    sources += [(site, url, fetch_page_items) for site, url in PAGES.items()]
+
     qualifying = []
-    for site, feed_url in FEEDS.items():
+    for site, feed_url, fetch in sources:
         try:
-            items = fetch_items(site, feed_url)
+            items = fetch(site, feed_url)
         except (requests.RequestException, ET.ParseError) as exc:
             print(f"[{now.isoformat()}] Failed to fetch {site}: {exc}", file=sys.stderr)
             continue
