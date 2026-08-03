@@ -14,11 +14,12 @@ import subprocess
 import sys
 
 # Placeholders are the common case in these repos' own READMEs
-# ("https://hooks.slack.com/services/..."), so every pattern requires
+# ("https://discord.com/api/webhooks/..."), so every pattern requires
 # token-shaped material rather than merely the surrounding syntax.
+#
+# This is a general credential scanner, not a Discord-specific one: the point is to
+# catch any secret on its way into a public repo, whichever provider issued it.
 PATTERNS = [
-    # Discord is what these monitors post to; Slack stays listed because a webhook left
-    # over from the migration is exactly the kind of thing that gets pasted into a file.
     ("Discord webhook URL",
      re.compile(r"discord(?:app)?\.com/api/webhooks/\d{17,20}/[A-Za-z0-9_-]{50,}")),
     ("Slack webhook URL",

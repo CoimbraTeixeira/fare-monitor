@@ -150,7 +150,7 @@ class MarkdownEscapingTests(unittest.TestCase):
         self.assertEqual(fm.escape_markdown(r"a\*b"), r"a\\\*b")
 
     def test_leaves_html_entities_alone(self):
-        """Discord renders &amp; literally, so Slack-style entity escaping is wrong."""
+        """Discord renders &amp; literally, so HTML-entity escaping is wrong here."""
         self.assertEqual(fm.escape_markdown("Prague & Warsaw"), "Prague & Warsaw")
         self.assertEqual(fm.escape_markdown("<deal>"), "<deal>")
 
@@ -163,7 +163,7 @@ class MarkdownEscapingTests(unittest.TestCase):
 
         with mock.patch.object(fm.requests, "post", fake_post):
             fm.send_discord_message("https://hook", [make_item("Deal *now* or_never")])
-        # Discord's payload key is "content"; Slack's "text" is silently ignored.
+        # Discord's payload key is "content"; any other key is silently ignored.
         self.assertIn("content", posted[0])
         self.assertIn(r"Deal \*now\* or\_never", posted[0]["content"])
 
@@ -264,24 +264,26 @@ class RateLimitTests(unittest.TestCase):
 
 
 class WebhookConfigTests(unittest.TestCase):
-    def test_leftover_slack_webhook_is_rejected_by_name(self):
-        """A Slack URL would otherwise fail as an opaque 400 from Discord."""
+    def _load(self, url):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            path.write_text(json.dumps(
-                {"webhook_url": "https://hooks.slack.com/services/T1/B2/xyz"}))
-            with mock.patch.object(fm, "CONFIG_PATH", path):
-                with self.assertRaises(SystemExit) as ctx:
-                    fm.load_webhook_url()
-        self.assertIn("Slack webhook", str(ctx.exception))
-
-    def test_discord_webhook_is_accepted(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            url = "https://discord.com/api/webhooks/123/abc"
             path.write_text(json.dumps({"webhook_url": url}))
             with mock.patch.object(fm, "CONFIG_PATH", path):
-                self.assertEqual(fm.load_webhook_url(), url)
+                return fm.load_webhook_url()
+
+    def test_non_discord_webhook_is_rejected_by_name(self):
+        """Any other provider's URL would fail as an opaque 400 from Discord."""
+        with self.assertRaises(SystemExit) as ctx:
+            self._load("https://example.com/services/T1/B2/xyz")
+        self.assertIn("does not hold a Discord webhook", str(ctx.exception))
+
+    def test_discord_webhook_is_accepted(self):
+        url = "https://discord.com/api/webhooks/123/abc"
+        self.assertEqual(self._load(url), url)
+
+    def test_legacy_discordapp_domain_is_accepted(self):
+        url = "https://discordapp.com/api/webhooks/123/abc"
+        self.assertEqual(self._load(url), url)
 
 
 class FetchItemsTests(unittest.TestCase):
