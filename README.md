@@ -53,7 +53,15 @@ pip install -r requirements.txt
 mkdir -p ~/.config/fare-monitor
 echo '{"webhook_url": "https://hooks.slack.com/services/..."}' > ~/.config/fare-monitor/config.json
 chmod 600 ~/.config/fare-monitor/config.json
+
+git config core.hooksPath hooks   # enable the pre-commit secret guard (see below)
 ```
+
+This repo is public, and the design keeps the webhook out of it entirely. `hooks/pre-commit`
+enforces that: it scans staged content for webhook URLs, API tokens and private keys, and
+refuses the commit if it finds one. Git does not enable repo-tracked hooks automatically, so
+the `core.hooksPath` line above is required once per clone. Bypass a false positive with
+`git commit --no-verify`.
 
 Then run it every six hours:
 
