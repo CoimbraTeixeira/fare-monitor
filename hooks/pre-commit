@@ -17,6 +17,10 @@ import sys
 # ("https://hooks.slack.com/services/..."), so every pattern requires
 # token-shaped material rather than merely the surrounding syntax.
 PATTERNS = [
+    # Discord is what these monitors post to; Slack stays listed because a webhook left
+    # over from the migration is exactly the kind of thing that gets pasted into a file.
+    ("Discord webhook URL",
+     re.compile(r"discord(?:app)?\.com/api/webhooks/\d{17,20}/[A-Za-z0-9_-]{50,}")),
     ("Slack webhook URL",
      re.compile(r"hooks\.slack\.com/services/T[A-Za-z0-9_]{6,}/B[A-Za-z0-9_]{6,}/[A-Za-z0-9]{20,}")),
     ("Slack API token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),

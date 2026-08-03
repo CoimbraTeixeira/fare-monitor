@@ -1,6 +1,6 @@
 # fare-monitor
 
-Watches airline deal sites for **error fares** (mistake fares) and posts matches to Slack.
+Watches airline deal sites for **error fares** (mistake fares) and posts matches to Discord.
 
 Error fares are pricing mistakes — a business-class ticket listed at economy prices, a
 missing fuel surcharge, a currency conversion gone wrong. They get pulled within hours,
@@ -12,7 +12,7 @@ error fare.
 
 ```
 RSS feeds ─┐
-           ├─→ clean HTML ─→ match patterns ─→ drop duplicates ─→ Slack
+           ├─→ clean HTML ─→ match patterns ─→ drop duplicates ─→ Discord
 HTML pages ─┘                                  (seen.json)
 ```
 
@@ -20,7 +20,7 @@ Each run fetches every source, keeps posts published within `LOOKBACK_HOURS` (24
 and matches their title, summary and tags against a small set of error-fare patterns
 (`error fare`, `mistake fare`, `may not be honoured`, `book before it's fixed`, …).
 
-Anything matched is posted to Slack and recorded in `seen.json`, so a deal is never
+Anything matched is posted to Discord and recorded in `seen.json`, so a deal is never
 alerted twice even though the lookback window overlaps between runs.
 
 ## Sources
@@ -51,7 +51,7 @@ Sites deliberately **not** included, and why:
 pip install -r requirements.txt
 
 mkdir -p ~/.config/fare-monitor
-echo '{"webhook_url": "https://hooks.slack.com/services/..."}' > ~/.config/fare-monitor/config.json
+echo '{"webhook_url": "https://discord.com/api/webhooks/..."}' > ~/.config/fare-monitor/config.json
 chmod 600 ~/.config/fare-monitor/config.json
 
 git config core.hooksPath hooks   # enable the pre-commit secret guard (see below)
@@ -76,7 +76,7 @@ double-alerting.
 ## Usage
 
 ```bash
-python3 fare_monitor.py              # normal run, posts to Slack
+python3 fare_monitor.py              # normal run, posts to Discord
 python3 fare_monitor.py --dry-run    # show what would be sent, post nothing
 python3 fare_monitor.py --verbose    # every item, with window / match / already-sent flags
 ```
@@ -93,7 +93,7 @@ know whether that is correct:
 ## State and failure handling
 
 `~/.config/fare-monitor/seen.json` records the RSS `guid` of every alerted post, pruned
-after 30 days. It is written **only after Slack accepts the message** — if the webhook
+after 30 days. It is written **only after Discord accepts the message** — if the webhook
 fails the run exits non-zero and leaves state untouched, so the next run retries rather
 than silently dropping the deal.
 
@@ -106,7 +106,7 @@ skipped; the others still run.
 python3 -m unittest test_fare_monitor
 ```
 
-34 tests, no network, no dependencies beyond the standard library. Error fares are rare,
+47 tests, no network, no dependencies beyond the standard library. Error fares are rare,
 so a correct run and a broken run both print `No qualifying error fares found` — these
 cover the paths that only execute on the day it matters, including detection against real
 historical error-fare titles.

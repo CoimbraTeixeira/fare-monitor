@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check error/mistake-fare RSS feeds and post qualifying deals to Slack."""
+"""Check error/mistake-fare RSS feeds and post qualifying deals to Discord."""
 
 import argparse
 import json
@@ -27,6 +27,14 @@ SEEN_RETENTION_DAYS = 30
 
 FETCH_ATTEMPTS = 3
 FETCH_BACKOFF_SECONDS = 3
+
+# Discord rejects a message body over 2000 characters outright (HTTP 400) rather than
+# truncating it, so this is a hard delivery constraint rather than a style preference.
+DISCORD_MESSAGE_LIMIT = 2000
+
+# Webhooks allow roughly 5 requests per 2 seconds; a multi-chunk alert can reach that.
+RATE_LIMIT_RETRIES = 3
+MAX_RETRY_SLEEP = 30.0
 
 # Deal-posting feeds only. General points/miles blogs (TPG, One Mile at a
 # Time, Thrifty Traveler) are deliberately excluded: they publish commentary
@@ -75,6 +83,14 @@ def load_webhook_url() -> str:
     url = config.get("webhook_url")
     if not url:
         sys.exit(f"No 'webhook_url' key in {CONFIG_PATH}")
+    if "hooks.slack.com" in url:
+        # Posting a Discord payload at a Slack webhook fails as an opaque 400. Naming
+        # the leftover config is the difference between a one-line fix and an evening.
+        sys.exit(
+            f"{CONFIG_PATH} still holds a Slack webhook. This monitor posts to Discord "
+            f"now -- replace it with a Discord webhook URL "
+            f"(Server Settings -> Integrations -> Webhooks)."
+        )
     return url
 
 
@@ -214,22 +230,74 @@ def is_error_fare(item: dict) -> bool:
     return bool(ERROR_FARE_RE.search(text))
 
 
-def escape_slack(text: str) -> str:
-    """Slack requires these three characters escaped in message text."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def escape_markdown(text: str) -> str:
+    """Neutralise Discord markdown in third-party text.
+
+    Deal titles are written by the feed authors and routinely contain asterisks and
+    underscores, which would otherwise bold or italicise the rest of the alert. Note
+    this escapes markdown rather than HTML entities -- Discord renders `&amp;`
+    literally, so the Slack-era entity escaping would have shown as visible noise."""
+    for char in ("\\", "*", "_", "~", "`", "|"):
+        text = text.replace(char, "\\" + char)
+    return text
 
 
-def send_slack_message(webhook_url: str, qualifying: list[dict]) -> None:
-    lines = [":airplane: *Error Fare Alert*", ""]
+def split_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split an over-long message into Discord-sized pieces on line boundaries.
+
+    A busy day can qualify enough deals to clear the limit, and Discord rejects an
+    over-long body outright rather than truncating it. Lines are kept whole so a deal
+    is never cut in half; an individual line longer than the limit is hard-split as a
+    last resort."""
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current, length = [], 0
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and length + 1 + len(line) > limit:
+            chunks.append("\n".join(current))
+            current, length = [], 0
+        current.append(line)
+        length += len(line) + (1 if length else 0)
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+def post_chunk(webhook_url: str, content: str) -> None:
+    """POST one chunk, honouring Discord's stated wait on a rate-limit response."""
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        resp = requests.post(webhook_url, json={"content": content}, timeout=15)
+        if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+            resp.raise_for_status()  # Discord returns 204 No Content on success
+            return
+        try:
+            wait = float(resp.json().get("retry_after", 1.0))
+        except (ValueError, AttributeError, requests.exceptions.JSONDecodeError):
+            wait = float(resp.headers.get("Retry-After", 1.0) or 1.0)
+        # Cap it: a malformed retry_after should not park a cron run for hours.
+        time.sleep(min(max(wait, 0.0), MAX_RETRY_SLEEP))
+
+
+def send_discord_message(webhook_url: str, qualifying: list[dict]) -> None:
+    lines = ["✈️ **Error Fare Alert**", ""]
     for item in qualifying:
-        lines.append(f"*{escape_slack(item['site'])}*")
-        lines.append(escape_slack(item["title"]))
+        lines.append(f"**{escape_markdown(item['site'])}**")
+        lines.append(escape_markdown(item["title"]))
+        # The link is deliberately unescaped: backslashes in a URL would break it, and
+        # Discord auto-links a bare URL anyway.
         lines.append(item["link"])
         lines.append(f"Published: {item['pub_date'].strftime('%Y-%m-%d %H:%M UTC')}")
         lines.append("")
-    payload = {"text": "\n".join(lines).strip()}
-    resp = requests.post(webhook_url, json=payload, timeout=15)
-    resp.raise_for_status()
+    for chunk in split_message("\n".join(lines).strip()):
+        post_chunk(webhook_url, chunk)
 
 
 def main() -> None:
@@ -237,7 +305,7 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true",
                         help="Print every fetched item (title, pubDate, in-window?, matched?) for debugging")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Report what would be sent without posting to Slack or recording state")
+                        help="Report what would be sent without posting to Discord or recording state")
     args = parser.parse_args()
 
     webhook_url = load_webhook_url()
@@ -282,10 +350,10 @@ def main() -> None:
         return
 
     try:
-        send_slack_message(webhook_url, qualifying)
+        send_discord_message(webhook_url, qualifying)
     except requests.RequestException as exc:
         # Leave the seen-file untouched so the next run retries these items.
-        sys.exit(f"[{now.isoformat()}] Failed to post to Slack: {exc}")
+        sys.exit(f"[{now.isoformat()}] Failed to post to Discord: {exc}")
 
     for i in qualifying:
         seen[i["id"]] = now.isoformat()

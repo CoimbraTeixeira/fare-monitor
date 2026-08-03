@@ -5,7 +5,7 @@ Run with:  python3 -m unittest -v test_fare_monitor
 
 Error fares are rare, so the alerting path would otherwise sit untested
 until the day it actually matters. Everything here is offline: feeds and
-the Slack webhook are stubbed, and state is written to a temp directory.
+the Discord webhook are stubbed, and state is written to a temp directory.
 """
 
 import io
@@ -24,16 +24,23 @@ import requests
 
 import fare_monitor as fm
 
+# A fixed instant, for tests that hand it to the code under test explicitly (the
+# seen-file retention ones). Deliberately NOT used to age feed items: main() reads the
+# real clock, so pinning item dates here gave the suite a 24-hour shelf life -- every
+# window-dependent test began failing once wall-clock time passed NOW + LOOKBACK_HOURS.
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
 
 
 def make_item(title, description="", categories=(), age_hours=1, item_id="id-1"):
-    """Build an item the way fetch_items would, with text already cleaned."""
+    """Build an item the way fetch_items would, with text already cleaned.
+
+    Ages are relative to the real clock so they stay meaningful against main()'s own
+    lookback window whenever the suite happens to run."""
     return {
         "site": "Test Site",
         "title": fm.clean_text(title),
         "link": "https://example.com/deal",
-        "pub_date": NOW - timedelta(hours=age_hours),
+        "pub_date": datetime.now(timezone.utc) - timedelta(hours=age_hours),
         "description": fm.clean_text(description),
         "categories": [fm.clean_text(c) for c in categories],
         "id": item_id,
@@ -45,13 +52,25 @@ def feed_bytes(items_xml):
 
 
 class FakeResponse:
-    def __init__(self, content=b"", exc=None):
+    def __init__(self, content=b"", exc=None, status_code=200, payload=None, headers=None):
         self.content = content
         self._exc = exc
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.headers = headers or {}
+
+    @property
+    def text(self):
+        return self.content.decode() if isinstance(self.content, bytes) else self.content
+
+    def json(self):
+        return self._payload
 
     def raise_for_status(self):
         if self._exc:
             raise self._exc
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
 
 class MatchingTests(unittest.TestCase):
@@ -120,24 +139,149 @@ class CleanTextTests(unittest.TestCase):
         self.assertEqual(fm.clean_text("Prague 🌴 for €594"), "Prague 🌴 for €594")
 
 
-class SlackEscapingTests(unittest.TestCase):
-    def test_escapes_required_characters(self):
-        self.assertEqual(fm.escape_slack("Prague & Warsaw"), "Prague &amp; Warsaw")
-        self.assertEqual(fm.escape_slack("<deal>"), "&lt;deal&gt;")
+class MarkdownEscapingTests(unittest.TestCase):
+    def test_escapes_discord_markdown(self):
+        self.assertEqual(fm.escape_markdown("*deal*"), r"\*deal\*")
+        self.assertEqual(fm.escape_markdown("LIS_TYO"), r"LIS\_TYO")
+        self.assertEqual(fm.escape_markdown("a|b~c`d"), r"a\|b\~c\`d")
 
-    def test_does_not_double_escape(self):
-        self.assertEqual(fm.escape_slack("a & b").count("amp"), 1)
+    def test_escapes_backslash_first(self):
+        """Escaping the backslash last would re-escape the ones just inserted."""
+        self.assertEqual(fm.escape_markdown(r"a\*b"), r"a\\\*b")
 
-    def test_payload_escapes_title(self):
-        posted = {}
+    def test_leaves_html_entities_alone(self):
+        """Discord renders &amp; literally, so Slack-style entity escaping is wrong."""
+        self.assertEqual(fm.escape_markdown("Prague & Warsaw"), "Prague & Warsaw")
+        self.assertEqual(fm.escape_markdown("<deal>"), "<deal>")
+
+    def test_payload_uses_content_key_and_escapes_title(self):
+        posted = []
 
         def fake_post(url, json=None, timeout=None):
-            posted["payload"] = json
+            posted.append(json)
             return FakeResponse()
 
         with mock.patch.object(fm.requests, "post", fake_post):
-            fm.send_slack_message("https://hook", [make_item("Prague & Warsaw")])
-        self.assertIn("Prague &amp; Warsaw", posted["payload"]["text"])
+            fm.send_discord_message("https://hook", [make_item("Deal *now* or_never")])
+        # Discord's payload key is "content"; Slack's "text" is silently ignored.
+        self.assertIn("content", posted[0])
+        self.assertIn(r"Deal \*now\* or\_never", posted[0]["content"])
+
+    def test_link_is_not_escaped(self):
+        """Backslashes in a URL would break it, and Discord auto-links bare URLs."""
+        posted = []
+
+        def fake_post(url, json=None, timeout=None):
+            posted.append(json)
+            return FakeResponse()
+
+        item = make_item("A deal")
+        item["link"] = "https://example.com/error_fare_to_tokyo"
+        with mock.patch.object(fm.requests, "post", fake_post):
+            fm.send_discord_message("https://hook", [item])
+        self.assertIn("https://example.com/error_fare_to_tokyo", posted[0]["content"])
+
+
+class MessageSplittingTests(unittest.TestCase):
+    def test_short_message_is_one_chunk(self):
+        self.assertEqual(fm.split_message("one\ntwo"), ["one\ntwo"])
+
+    def test_empty_message_still_yields_a_chunk(self):
+        self.assertEqual(fm.split_message(""), [""])
+
+    def test_every_chunk_is_within_the_limit(self):
+        text = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
+        chunks = fm.split_message(text)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), fm.DISCORD_MESSAGE_LIMIT)
+
+    def test_split_preserves_content_and_line_boundaries(self):
+        text = "\n".join(f"deal {i}" for i in range(600))
+        chunks = fm.split_message(text)
+        self.assertEqual("\n".join(chunks), text)  # nothing lost or duplicated
+        for chunk in chunks:
+            self.assertFalse(chunk.startswith("\n"))
+
+    def test_line_longer_than_limit_is_hard_split(self):
+        chunks = fm.split_message("y" * (fm.DISCORD_MESSAGE_LIMIT * 2 + 5))
+        self.assertEqual(len(chunks), 3)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), fm.DISCORD_MESSAGE_LIMIT)
+
+    def test_oversized_alert_posts_multiple_times(self):
+        posted = []
+
+        def fake_post(url, json=None, timeout=None):
+            posted.append(json["content"])
+            return FakeResponse()
+
+        items = [make_item("Error fare " + "z" * 120, item_id=f"i{i}") for i in range(40)]
+        with mock.patch.object(fm.requests, "post", fake_post):
+            fm.send_discord_message("https://hook", items)
+        self.assertGreater(len(posted), 1)
+        for chunk in posted:
+            self.assertLessEqual(len(chunk), fm.DISCORD_MESSAGE_LIMIT)
+
+
+class RateLimitTests(unittest.TestCase):
+    def test_retries_after_429_and_succeeds(self):
+        calls = []
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(json)
+            if len(calls) == 1:
+                return FakeResponse(status_code=429, payload={"retry_after": 0.01})
+            return FakeResponse()
+
+        with mock.patch.object(fm.requests, "post", fake_post), \
+             mock.patch.object(fm.time, "sleep") as slept:
+            fm.post_chunk("https://hook", "hello")
+        self.assertEqual(len(calls), 2)
+        slept.assert_called_once()
+        self.assertAlmostEqual(slept.call_args[0][0], 0.01, places=3)
+
+    def test_retry_wait_is_capped(self):
+        """A malformed retry_after must not park a cron run for hours."""
+        def fake_post(url, json=None, timeout=None):
+            return FakeResponse(status_code=429, payload={"retry_after": 99999})
+
+        with mock.patch.object(fm.requests, "post", fake_post), \
+             mock.patch.object(fm.time, "sleep") as slept:
+            with self.assertRaises(requests.HTTPError):
+                fm.post_chunk("https://hook", "hello")
+        for call in slept.call_args_list:
+            self.assertLessEqual(call[0][0], fm.MAX_RETRY_SLEEP)
+
+    def test_gives_up_after_repeated_429(self):
+        def fake_post(url, json=None, timeout=None):
+            return FakeResponse(status_code=429, payload={"retry_after": 0})
+
+        with mock.patch.object(fm.requests, "post", fake_post), \
+             mock.patch.object(fm.time, "sleep"):
+            with self.assertRaises(requests.HTTPError):
+                fm.post_chunk("https://hook", "hello")
+
+
+class WebhookConfigTests(unittest.TestCase):
+    def test_leftover_slack_webhook_is_rejected_by_name(self):
+        """A Slack URL would otherwise fail as an opaque 400 from Discord."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps(
+                {"webhook_url": "https://hooks.slack.com/services/T1/B2/xyz"}))
+            with mock.patch.object(fm, "CONFIG_PATH", path):
+                with self.assertRaises(SystemExit) as ctx:
+                    fm.load_webhook_url()
+        self.assertIn("Slack webhook", str(ctx.exception))
+
+    def test_discord_webhook_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            url = "https://discord.com/api/webhooks/123/abc"
+            path.write_text(json.dumps({"webhook_url": url}))
+            with mock.patch.object(fm, "CONFIG_PATH", path):
+                self.assertEqual(fm.load_webhook_url(), url)
 
 
 class FetchItemsTests(unittest.TestCase):
@@ -262,7 +406,7 @@ class RetryTests(unittest.TestCase):
 
 
 class MainFlowTests(unittest.TestCase):
-    """End-to-end runs of main() with feeds and Slack stubbed out."""
+    """End-to-end runs of main() with feeds and Discord stubbed out."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -310,7 +454,7 @@ class MainFlowTests(unittest.TestCase):
         self.assertIn("No qualifying", self.run_main([item]))
         self.assertFalse(fm.SEEN_PATH.exists())
 
-    def test_slack_failure_leaves_state_unwritten(self):
+    def test_discord_failure_leaves_state_unwritten(self):
         """State must not record a send that never happened, or we lose the deal."""
 
         def boom(url, json=None, timeout=None):
