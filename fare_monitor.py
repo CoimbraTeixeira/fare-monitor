@@ -7,13 +7,14 @@ import os
 import re
 import sys
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
 
+import defusedxml.ElementTree as ET
 import requests
+from defusedxml.common import DefusedXmlException
 
 CONFIG_DIR = Path.home() / ".config" / "fare-monitor"
 CONFIG_PATH = CONFIG_DIR / "config.json"
@@ -179,6 +180,9 @@ def fetch_page_items(site: str, page_url: str) -> list[dict]:
 
 
 def fetch_items(site: str, feed_url: str) -> list[dict]:
+    # defusedxml rather than the stdlib parser: feed bodies are third-party input and
+    # xml.etree is vulnerable to entity-expansion bombs, where a few KB of XML expands
+    # to gigabytes and takes the run down with it.
     root = ET.fromstring(http_get(feed_url).content)
     items = []
     for item in root.findall("./channel/item"):
@@ -248,7 +252,7 @@ def main() -> None:
     for site, feed_url, fetch in sources:
         try:
             items = fetch(site, feed_url)
-        except (requests.RequestException, ET.ParseError) as exc:
+        except (requests.RequestException, ET.ParseError, DefusedXmlException) as exc:
             print(f"[{now.isoformat()}] Failed to fetch {site}: {exc}", file=sys.stderr)
             continue
         if args.verbose:
