@@ -34,8 +34,8 @@ alerted twice even though the lookback window overlaps between runs.
 | [Fare Deal Alert](https://faredealalert.com/) | RSS | Low volume, pure airfare |
 
 Secret Flying is read from HTML because Cloudflare returns 403 for its feed and category
-pages. Its `robots.txt` permits crawling at `Crawl-delay: 1`; one request per six-hour run
-is well inside that.
+pages. Its `robots.txt` permits crawling at `Crawl-delay: 1` — one second between
+requests — so one request per hourly run is well inside that.
 
 Sites deliberately **not** included, and why:
 
@@ -63,15 +63,20 @@ refuses the commit if it finds one. Git does not enable repo-tracked hooks autom
 the `core.hooksPath` line above is required once per clone. Bypass a false positive with
 `git commit --no-verify`.
 
-Then run it every six hours:
+Then run it every hour:
 
 ```cron
-0 */6 * * * /usr/bin/python3 /path/to/fare_monitor.py >> /path/to/monitor.log 2>&1
+7 * * * * /usr/bin/python3 /path/to/fare_monitor.py >> /path/to/monitor.log 2>&1
 ```
 
-The lookback window is wider than the cron interval on purpose: if a run fails, the next
-one still catches what it missed, and the seen-file prevents the overlap from
-double-alerting.
+Hourly, because that is what the thing being watched demands: an error fare is a pricing
+mistake, and mistakes get corrected. A six-hour cadence can miss one entirely between
+runs — and a deal found five hours late is often a deal already pulled.
+
+The lookback window (24h) is far wider than the interval on purpose: if a run fails, the
+next one still catches what it missed. Re-examining the same window hourly is safe
+because the seen-file gates posting, not fetching — a deal is alerted once no matter how
+many runs observe it.
 
 ## Usage
 
