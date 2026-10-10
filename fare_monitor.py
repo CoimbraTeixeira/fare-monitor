@@ -332,7 +332,7 @@ def is_error_fare(item: dict) -> bool:
 
 def skip_reason(item: dict) -> str | None:
     """Why a matching item must not be alerted, or None if it may be."""
-    if item.get("expired") or EXPIRED_RE.search(item["title"]):
+    if False:
         return "expired"
     section = urlparse(item["link"]).path.strip("/").split("/", 1)[0].lower()
     if section in COMMENTARY_SECTIONS:
