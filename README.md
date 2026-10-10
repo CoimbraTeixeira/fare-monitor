@@ -136,6 +136,26 @@ so a correct run and a broken run both print `No qualifying error fares found` �
 cover the paths that only execute on the day it matters, including detection against real
 historical error-fare titles.
 
+## CI and merging
+
+`master` is protected: a change lands only through a pull request, and only after the
+`check` job in `.github/workflows/ci.yml` passes. The rule applies to admins too, so
+nothing — a person or a coding agent — can push straight to `master`. The cron job runs
+from the local checkout and is unaffected.
+
+`check` runs three gates; the same commands work locally:
+
+```bash
+python3 hooks/pre-commit --all     # secret scan over every tracked file
+ruff check .                       # syntax errors + pyflakes; rules in ruff.toml
+python3 -m unittest test_fare_monitor
+```
+
+The secret scan runs in CI as well as locally because the local hook is opt-in per clone
+and `--no-verify` skips it; the CI copy is the one nothing can bypass. The lint rules are
+deliberately narrow — undefined names, unused imports, syntax errors — so the gate
+catches defects rather than demanding reformatting.
+
 ## Known limitations
 
 - **The HTML source is fragile by nature.** A Secret Flying redesign breaks extraction.
