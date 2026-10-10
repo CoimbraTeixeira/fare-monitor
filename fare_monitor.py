@@ -18,8 +18,39 @@ import requests
 from defusedxml.common import DefusedXmlException
 
 CONFIG_DIR = Path.home() / ".config" / "fare-monitor"
-CONFIG_PATH = CONFIG_DIR / "config.json"
-SEEN_PATH = CONFIG_DIR / "seen.json"
+
+
+def config_path(environ=os.environ) -> Path:
+    """Webhook config location; MONITOR_CONFIG overrides it.
+
+    The override exists so a test sandbox can point the monitor at a fake webhook
+    without touching the real config the hourly cron reads.
+    """
+    override = environ.get("MONITOR_CONFIG")
+    return Path(override) if override else CONFIG_DIR / "config.json"
+
+
+def state_dir(environ=os.environ) -> Path:
+    """Where seen.json lives; FARE_MONITOR_STATE_DIR overrides it.
+
+    A sandboxed run must not read or write the live seen-file: reading it hides deals
+    the scenario expects, and writing it would suppress real alerts on the next cron run.
+    """
+    override = environ.get("FARE_MONITOR_STATE_DIR")
+    return Path(override) if override else CONFIG_DIR
+
+
+CONFIG_PATH = config_path()
+SEEN_PATH = state_dir() / "seen.json"
+
+# Optional JSON file that replaces FEEDS and PAGES wholesale, so a run can read recorded
+# copies from a local fake server instead of the live sites.
+SOURCES_ENV = "FARE_MONITOR_SOURCES"
+
+# A webhook served by a local fake (http://127.0.0.1:<port>/api/webhooks/...) is the
+# only non-Discord URL accepted: tests need a real HTTP endpoint, and loopback cannot
+# leak an alert anywhere.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 # Generous window: duplicate alerts are prevented by the seen-file, so a wide
 # lookback lets a run recover items that a previous failed run missed.
@@ -101,7 +132,7 @@ def load_webhook_url() -> str:
     url = config.get("webhook_url")
     if not url:
         sys.exit(f"No 'webhook_url' key in {CONFIG_PATH}")
-    if "discord.com/api/webhooks/" not in url and "discordapp.com/api/webhooks/" not in url:
+    if not is_discord_webhook(url) and not is_loopback_webhook(url):
         # A webhook from somewhere else would fail as an opaque 400 from Discord.
         # Naming the config is the difference between a one-line fix and an evening.
         sys.exit(
@@ -109,6 +140,52 @@ def load_webhook_url() -> str:
             f"Discord -- get one from Server Settings -> Integrations -> Webhooks."
         )
     return url
+
+
+def is_discord_webhook(url: str) -> bool:
+    return "discord.com/api/webhooks/" in url or "discordapp.com/api/webhooks/" in url
+
+
+def is_loopback_webhook(url: str) -> bool:
+    """True for a local fake webhook: plain http, loopback host, Discord's path shape.
+
+    The host must match exactly; "127.0.0.1.example.com" or a remote host serving
+    /api/webhooks/ is still rejected, so this cannot become a way to post elsewhere.
+    """
+    parsed = urlparse(url)
+    return (parsed.scheme == "http"
+            and parsed.hostname in LOOPBACK_HOSTS
+            and parsed.path.startswith("/api/webhooks/"))
+
+
+def load_sources(environ=os.environ) -> tuple[dict[str, str], dict[str, str]]:
+    """(feeds, pages) to read: FEEDS and PAGES, or the FARE_MONITOR_SOURCES file.
+
+    The file replaces both wholesale rather than merging, so a sandboxed run can never
+    fall through to a live site it forgot to list. Its shape is checked up front: a
+    typo would otherwise surface as every source "failing to fetch", which reads like
+    an outage rather than a broken config.
+    """
+    path = environ.get(SOURCES_ENV)
+    if not path:
+        return FEEDS, PAGES
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.exit(f"Cannot read {SOURCES_ENV} file {path}: {exc}")
+    if not isinstance(data, dict) or set(data) != {"feeds", "pages"}:
+        sys.exit(f'{SOURCES_ENV} file {path} must be a JSON object with exactly the keys '
+                 f'"feeds" and "pages", each mapping source name -> URL.')
+    for kind in ("feeds", "pages"):
+        section = data[kind]
+        if not isinstance(section, dict) or not all(
+            isinstance(name, str) and isinstance(url, str)
+            and urlparse(url).scheme in ("http", "https")
+            for name, url in section.items()
+        ):
+            sys.exit(f'{SOURCES_ENV} file {path}: "{kind}" must map source name -> '
+                     f"http(s) URL.")
+    return data["feeds"], data["pages"]
 
 
 def load_seen() -> dict[str, str]:
@@ -139,7 +216,7 @@ def save_seen(seen: dict[str, str], now: datetime) -> None:
         if recorded_at >= horizon:
             pruned[item_id] = recorded_at.isoformat()
 
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = SEEN_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(pruned, indent=2, sort_keys=True))
     os.replace(tmp, SEEN_PATH)
@@ -346,8 +423,9 @@ def main() -> None:
     cutoff = now - timedelta(hours=LOOKBACK_HOURS)
     seen = load_seen()
 
-    sources = [(site, url, fetch_items) for site, url in FEEDS.items()]
-    sources += [(site, url, fetch_page_items) for site, url in PAGES.items()]
+    feeds, pages = load_sources()
+    sources = [(site, url, fetch_items) for site, url in feeds.items()]
+    sources += [(site, url, fetch_page_items) for site, url in pages.items()]
 
     qualifying = []
     for site, feed_url, fetch in sources:

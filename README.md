@@ -125,13 +125,51 @@ entries are discarded rather than aborting the run.
 Feed fetches retry three times with backoff. A source that fails is logged to stderr and
 skipped; the others still run.
 
+## Running against fakes
+
+Every outside dependency can be redirected with an environment variable, so the real code
+can run end to end against local fake services (the `factory` repo's `fakes/`) with no
+real side effects. Each is opt-in: unset, the monitor reads and writes exactly what the
+cron job does.
+
+| Variable | Default | Replaces |
+|---|---|---|
+| `MONITOR_CONFIG` | `~/.config/fare-monitor/config.json` | the webhook config file |
+| `FARE_MONITOR_STATE_DIR` | `~/.config/fare-monitor` | the directory holding `seen.json` |
+| `FARE_MONITOR_SOURCES` | built-in `FEEDS` and `PAGES` | every source, wholesale |
+
+`FARE_MONITOR_SOURCES` names a JSON file with exactly two keys, each mapping source name
+to an http(s) URL:
+
+```json
+{"feeds": {"Fly4Free": "http://127.0.0.1:8765/sources/fly4free.xml"},
+ "pages": {"Secret Flying": "http://127.0.0.1:8765/sources/secret-flying.html"}}
+```
+
+It replaces the built-in lists rather than merging with them, so a sandboxed run cannot
+fall through to a live site it forgot to list; a malformed file stops the run with a
+message naming it. Recorded Secret Flying pages work unchanged, because the parser keys on
+the absolute `https://www.secretflying.com/posts/` links inside the page, not on where the
+page was served from.
+
+The webhook check accepts one non-Discord URL shape: a loopback fake, plain `http` to
+exactly `127.0.0.1` or `localhost` with a path under `/api/webhooks/`. Any other host is
+still rejected.
+
+```bash
+MONITOR_CONFIG=/tmp/sandbox/config.json \
+FARE_MONITOR_STATE_DIR=/tmp/sandbox/state \
+FARE_MONITOR_SOURCES=/tmp/sandbox/sources.json \
+python3 fare_monitor.py --verbose
+```
+
 ## Tests
 
 ```bash
 python3 -m unittest test_fare_monitor
 ```
 
-55 tests, no network, no dependencies beyond the standard library. Error fares are rare,
+67 tests, no network, no dependencies beyond the standard library. Error fares are rare,
 so a correct run and a broken run both print `No qualifying error fares found` — these
 cover the paths that only execute on the day it matters, including detection against real
 historical error-fare titles.
