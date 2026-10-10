@@ -10,8 +10,10 @@ the Discord webhook are stubbed, and state is written to a temp directory.
 
 import io
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -286,6 +288,114 @@ class WebhookConfigTests(unittest.TestCase):
         url = "https://discordapp.com/api/webhooks/123/abc"
         self.assertEqual(self._load(url), url)
 
+    def test_loopback_fake_webhook_is_accepted(self):
+        """A local fake server is the one non-Discord endpoint allowed: it cannot leak."""
+        for url in ["http://127.0.0.1:8765/api/webhooks/1/fake",
+                    "http://localhost:8765/api/webhooks/1/fake"]:
+            with self.subTest(url=url):
+                self.assertEqual(self._load(url), url)
+
+    def test_non_loopback_lookalikes_are_rejected(self):
+        for url in ["http://example.com/api/webhooks/1/fake",
+                    "http://127.0.0.1.example.com/api/webhooks/1/fake",
+                    "http://10.0.0.5:8765/api/webhooks/1/fake",
+                    "http://127.0.0.1:8765/services/1/fake"]:
+            with self.subTest(url=url), self.assertRaises(SystemExit) as ctx:
+                self._load(url)
+            self.assertIn("does not hold a Discord webhook", str(ctx.exception))
+
+
+class EnvironmentSeamTests(unittest.TestCase):
+    """Opt-in overrides that let a sandbox run the real code against fakes.
+
+    Unset, every one of them must resolve to exactly what the cron job uses today.
+    """
+
+    def test_paths_default_to_config_dir(self):
+        self.assertEqual(fm.config_path({}), fm.CONFIG_DIR / "config.json")
+        self.assertEqual(fm.state_dir({}), fm.CONFIG_DIR)
+        self.assertEqual(fm.CONFIG_DIR, Path.home() / ".config" / "fare-monitor")
+
+    def test_empty_override_means_default(self):
+        env = {"MONITOR_CONFIG": "", "FARE_MONITOR_STATE_DIR": ""}
+        self.assertEqual(fm.config_path(env), fm.CONFIG_DIR / "config.json")
+        self.assertEqual(fm.state_dir(env), fm.CONFIG_DIR)
+
+    def test_overrides_are_honoured(self):
+        env = {"MONITOR_CONFIG": "/tmp/sandbox/config.json",
+               "FARE_MONITOR_STATE_DIR": "/tmp/sandbox/state"}
+        self.assertEqual(fm.config_path(env), Path("/tmp/sandbox/config.json"))
+        self.assertEqual(fm.state_dir(env), Path("/tmp/sandbox/state"))
+
+    def _module_paths(self, env):
+        """CONFIG_PATH and SEEN_PATH as a fresh import resolves them under `env`."""
+        code = "import fare_monitor as m; print(m.CONFIG_PATH); print(m.SEEN_PATH)"
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("MONITOR_CONFIG", "FARE_MONITOR_STATE_DIR")}
+        out = subprocess.run([sys.executable, "-c", code], env={**clean, **env},
+                             cwd=Path(__file__).parent, capture_output=True, text=True,
+                             check=True).stdout.splitlines()
+        return Path(out[0]), Path(out[1])
+
+    def test_module_constants_follow_environment_at_import(self):
+        home_dir = Path.home() / ".config" / "fare-monitor"
+        self.assertEqual(self._module_paths({}),
+                         (home_dir / "config.json", home_dir / "seen.json"))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                self._module_paths({"MONITOR_CONFIG": f"{tmp}/c.json",
+                                    "FARE_MONITOR_STATE_DIR": f"{tmp}/state"}),
+                (Path(tmp) / "c.json", Path(tmp) / "state" / "seen.json"),
+            )
+
+    def test_save_seen_creates_overridden_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seen_path = Path(tmp) / "nested" / "state" / "seen.json"
+            with mock.patch.object(fm, "SEEN_PATH", seen_path):
+                fm.save_seen({"x": NOW.isoformat()}, NOW)
+            self.assertEqual(list(json.loads(seen_path.read_text())), ["x"])
+
+
+class SourcesOverrideTests(unittest.TestCase):
+    def _load(self, content):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sources.json"
+            path.write_text(content if isinstance(content, str) else json.dumps(content))
+            return fm.load_sources({"FARE_MONITOR_SOURCES": str(path)})
+
+    def test_unset_means_built_in_sources(self):
+        self.assertIs(fm.load_sources({})[0], fm.FEEDS)
+        self.assertIs(fm.load_sources({})[1], fm.PAGES)
+        self.assertIs(fm.load_sources({"FARE_MONITOR_SOURCES": ""})[0], fm.FEEDS)
+
+    def test_file_replaces_feeds_and_pages_wholesale(self):
+        feeds, pages = self._load({
+            "feeds": {"Fake Feed": "http://127.0.0.1:9/sources/feed.xml"},
+            "pages": {},
+        })
+        self.assertEqual(feeds, {"Fake Feed": "http://127.0.0.1:9/sources/feed.xml"})
+        self.assertEqual(pages, {})  # not merged with the live Secret Flying page
+
+    def test_malformed_file_exits_with_clear_message(self):
+        cases = {
+            "not json": "{ nope",
+            "not an object": [],
+            "missing pages": {"feeds": {}},
+            "unknown key": {"feeds": {}, "pages": {}, "page": {}},
+            "section not a mapping": {"feeds": ["http://x"], "pages": {}},
+            "url not a string": {"feeds": {"A": 1}, "pages": {}},
+            "url not http": {"feeds": {}, "pages": {"A": "file:///etc/passwd"}},
+        }
+        for label, content in cases.items():
+            with self.subTest(label), self.assertRaises(SystemExit) as ctx:
+                self._load(content)
+            self.assertIn("FARE_MONITOR_SOURCES", str(ctx.exception))
+
+    def test_missing_file_exits(self):
+        with self.assertRaises(SystemExit) as ctx:
+            fm.load_sources({"FARE_MONITOR_SOURCES": "/nonexistent/sources.json"})
+        self.assertIn("Cannot read FARE_MONITOR_SOURCES", str(ctx.exception))
+
 
 class FetchItemsTests(unittest.TestCase):
     ITEM = (
@@ -468,6 +578,12 @@ class MainFlowTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+        # An override leaking in from the caller's shell would replace the stubbed FEEDS.
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("FARE_MONITOR_SOURCES", None)
+
         patcher = mock.patch.object(sys, "argv", ["fare_monitor.py"])
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -526,6 +642,26 @@ class MainFlowTests(unittest.TestCase):
         self.assertIn("DRY RUN", out)
         self.assertEqual(self.posts, [])
         self.assertFalse(fm.SEEN_PATH.exists())
+
+    def test_sources_file_drives_which_urls_are_fetched(self):
+        sources = self.tmp / "sources.json"
+        sources.write_text(json.dumps({
+            "feeds": {"Fake Feed": "http://127.0.0.1:9/sources/feed.xml"},
+            "pages": {"Fake Page": "http://127.0.0.1:9/sources/page.html"},
+        }))
+        fetched = []
+
+        def record(site, url):
+            fetched.append((site, url))
+            return []
+
+        os.environ["FARE_MONITOR_SOURCES"] = str(sources)
+        with mock.patch.object(fm, "fetch_items", record), \
+                mock.patch.object(fm, "fetch_page_items", record), \
+                redirect_stdout(io.StringIO()):
+            fm.main()
+        self.assertEqual(fetched, [("Fake Feed", "http://127.0.0.1:9/sources/feed.xml"),
+                                   ("Fake Page", "http://127.0.0.1:9/sources/page.html")])
 
 
 class SeenFileTests(unittest.TestCase):
