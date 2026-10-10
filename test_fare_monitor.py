@@ -31,7 +31,8 @@ import fare_monitor as fm
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
 
 
-def make_item(title, description="", categories=(), age_hours=1, item_id="id-1"):
+def make_item(title, description="", categories=(), age_hours=1, item_id="id-1",
+              link="https://example.com/deal"):
     """Build an item the way fetch_items would, with text already cleaned.
 
     Ages are relative to the real clock so they stay meaningful against main()'s own
@@ -39,7 +40,7 @@ def make_item(title, description="", categories=(), age_hours=1, item_id="id-1")
     return {
         "site": "Test Site",
         "title": fm.clean_text(title),
-        "link": "https://example.com/deal",
+        "link": link,
         "pub_date": datetime.now(timezone.utc) - timedelta(hours=age_hours),
         "description": fm.clean_text(description),
         "categories": [fm.clean_text(c) for c in categories],
@@ -329,11 +330,16 @@ class PageParsingTests(unittest.TestCase):
         cls.items = fm.parse_page_items("Secret Flying", cls.html)
 
     def test_extracts_posts_with_dates_and_links(self):
-        self.assertGreaterEqual(len(self.items), 3)
+        self.assertEqual(len(self.items), 2)
         for item in self.items:
             with self.subTest(link=item["link"]):
                 self.assertIn("/posts/", item["link"])
                 self.assertIsNotNone(item["pub_date"].tzinfo)
+
+    def test_category_widget_is_not_taken_as_a_post(self):
+        """The fixture's "Trending flight deals" widget links to /posts/category/...;
+        that is a listing page, and was once emitted as a deal."""
+        self.assertFalse([i for i in self.items if "/posts/category/" in i["link"]])
 
     def test_deduplicates_repeated_links(self):
         links = [i["link"] for i in self.items]
@@ -372,6 +378,42 @@ class PageParsingTests(unittest.TestCase):
             items = fm.fetch_page_items("Secret Flying", "https://example.com/")
         self.assertEqual(items, [])
         self.assertIn("0 posts", err.getvalue())
+
+    def test_expired_stamp_is_carried_on_the_item(self):
+        """Secret Flying stamps pulled deals rather than removing them."""
+        self.assertFalse(any(i["expired"] for i in self.items))
+        stamped = self.html.replace(
+            '<div class="entry-img">',
+            '<div class="entry-img"><img src="/EXPIRED1.gif" class="expiredStamp">', 1)
+        items = fm.parse_page_items("Secret Flying", stamped)
+        self.assertTrue(items[0]["expired"])
+        self.assertEqual(fm.skip_reason(items[0]), "expired")
+
+
+class SkipReasonTests(unittest.TestCase):
+    def test_live_deal_is_not_skipped(self):
+        self.assertIsNone(fm.skip_reason(make_item(
+            "ERROR FARE: New York to Seychelles $335",
+            link="https://travel-dealz.com/deal/newyork-seychelles-fare/")))
+
+    def test_expired_title_is_skipped(self):
+        for title in ("**EXPIRED** ERROR FARE: Business to Seoul", "Error fare (expired)"):
+            with self.subTest(title=title):
+                self.assertEqual(fm.skip_reason(make_item(title)), "expired")
+
+    def test_commentary_sections_are_skipped(self):
+        """News about an error fare matches the patterns but is never bookable."""
+        for link in ("https://www.fly4free.com/news/airline-honours-error-fare/",
+                     "https://travel-dealz.de/blog/anleitung-errorfare-buchen"):
+            with self.subTest(link=link):
+                self.assertEqual(
+                    fm.skip_reason(make_item("Mistake fare honoured", link=link)),
+                    "commentary")
+
+    def test_section_match_is_on_the_first_path_segment_only(self):
+        """A deal whose slug merely contains 'news' must still alert."""
+        item = make_item("Error fare", link="https://example.com/deal/good-news-error-fare/")
+        self.assertIsNone(fm.skip_reason(item))
 
 
 class RetryTests(unittest.TestCase):
@@ -456,6 +498,18 @@ class MainFlowTests(unittest.TestCase):
         self.assertIn("No qualifying", self.run_main([item]))
         self.assertFalse(fm.SEEN_PATH.exists())
 
+    def test_skipped_items_are_not_alerted_or_recorded(self):
+        """Expired and commentary items match the patterns; only the live deal posts."""
+        items = [
+            make_item("**EXPIRED** ERROR FARE: Dublin to USA", item_id="expired"),
+            make_item("Airline honours last week's mistake fare", item_id="news",
+                      link="https://www.fly4free.com/news/airline-honours-fare/"),
+            make_item("ERROR FARE: Oslo to Bangkok", item_id="live"),
+        ]
+        self.assertIn("Sent alert for 1 item", self.run_main(items))
+        self.assertIn("Oslo to Bangkok", self.posts[0]["content"])
+        self.assertEqual(list(json.loads(fm.SEEN_PATH.read_text())), ["live"])
+
     def test_discord_failure_leaves_state_unwritten(self):
         """State must not record a send that never happened, or we lose the deal."""
 
@@ -491,16 +545,20 @@ class SeenFileTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(fm.load_seen(), {})
 
-    def test_prunes_expired_and_malformed_entries(self):
+    def test_prunes_expired_and_malformed_entries_and_normalizes_naive_dates(self):
         fm.save_seen(
             {
                 "keep": NOW.isoformat(),
+                "naive": "2026-08-02T11:00:00",
                 "expired": (NOW - timedelta(days=60)).isoformat(),
                 "malformed": "not-a-timestamp",
+                "not-string": None,
             },
             NOW,
         )
-        self.assertEqual(sorted(json.loads(fm.SEEN_PATH.read_text())), ["keep"])
+        stored = json.loads(fm.SEEN_PATH.read_text())
+        self.assertEqual(sorted(stored), ["keep", "naive"])
+        self.assertEqual(stored["naive"], "2026-08-02T11:00:00+00:00")
 
     def test_round_trips(self):
         fm.save_seen({"a": NOW.isoformat()}, NOW)

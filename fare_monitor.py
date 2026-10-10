@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
+from urllib.parse import urlparse
 
 import defusedxml.ElementTree as ET
 import requests
@@ -45,19 +46,36 @@ FEEDS = {
     "Fly4Free": "https://www.fly4free.com/feed/",
     "Fare Deal Alert": "https://faredealalert.com/feed/",
     "Travelfree": "https://travelfree.info/feed/",
+    # Travel Dealz titles error fares explicitly ("ERROR FARE: ...") and tags them
+    # "Error Fares". Its tag feed is empty because deals are a custom post type, so
+    # the main feeds are read and the commentary sections filtered by URL below.
+    "Travel Dealz": "https://travel-dealz.com/feed/",
+    "Travel Dealz DE": "https://travel-dealz.de/feed/",
 }
+
+# First URL path segments that hold articles *about* deals rather than deals. A news
+# piece on an airline honouring last week's error fare matches every pattern and is
+# not bookable. Fly4Free and Travel Dealz both mix these into their deal feeds.
+COMMENTARY_SECTIONS = frozenset({"news", "blog", "lexikon", "podcast", "magazin"})
+
+# Sites mark a pulled deal rather than deleting it. Secret Flying stamps the listing
+# with an EXPIRED image and prefixes the title with "**EXPIRED**"; an alert for a fare
+# already gone is noise, and arrives most often after an outage, when the lookback
+# window is catching up.
+EXPIRED_RE = re.compile(r"\bexpired\b", re.IGNORECASE)
+EXPIRED_STAMP = 'class="expiredStamp"'
 
 # Sites with no usable feed, read from HTML instead. Secret Flying is the only
 # source here that labels error fares explicitly ("ERROR FARE" in the title),
 # but Cloudflare 403s its /feed/ and category pages; the homepage is served
 # normally, and their robots.txt allows crawling at Crawl-delay: 1. One request
-# every 6h is well inside that.
+# per hourly run is well inside that.
 PAGES = {
     "Secret Flying": "https://www.secretflying.com/",
 }
 
 ARTICLE_RE = re.compile(r"<article.*?</article>", re.DOTALL)
-POST_LINK_RE = re.compile(r'href="(https://www\.secretflying\.com/posts/[^"]+)"')
+POST_LINK_RE = re.compile(r'href="(https://www\.secretflying\.com/posts/(?!category/)[^"]+)"')
 DATETIME_RE = re.compile(r'datetime="([^"]+)"')
 ANCHOR_RE = re.compile(
     r'<a[^>]*href="https://www\.secretflying\.com/posts/[^"]*"[^>]*>(.*?)</a>', re.DOTALL
@@ -111,10 +129,15 @@ def save_seen(seen: dict[str, str], now: datetime) -> None:
     pruned = {}
     for item_id, stamp in seen.items():
         try:
-            if datetime.fromisoformat(stamp) >= horizon:
-                pruned[item_id] = stamp
-        except ValueError:
+            recorded_at = datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
             continue  # drop malformed entries
+        if recorded_at.tzinfo is None:
+            # Older hand-written state may omit the timezone. Treat it as UTC, as
+            # RSS dates without an offset are handled elsewhere in this module.
+            recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+        if recorded_at >= horizon:
+            pruned[item_id] = recorded_at.isoformat()
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp = SEEN_PATH.with_suffix(".json.tmp")
@@ -181,6 +204,7 @@ def parse_page_items(site: str, html: str) -> list[dict]:
             "description": slug_words,
             "categories": [],
             "id": link,
+            "expired": EXPIRED_STAMP in block,
         })
     return items
 
@@ -227,6 +251,16 @@ def fetch_items(site: str, feed_url: str) -> list[dict]:
 def is_error_fare(item: dict) -> bool:
     text = " ".join([item["title"], item["description"], *item["categories"]])
     return bool(ERROR_FARE_RE.search(text))
+
+
+def skip_reason(item: dict) -> str | None:
+    """Why a matching item must not be alerted, or None if it may be."""
+    if item.get("expired") or EXPIRED_RE.search(item["title"]):
+        return "expired"
+    section = urlparse(item["link"]).path.strip("/").split("/", 1)[0].lower()
+    if section in COMMENTARY_SECTIONS:
+        return "commentary"
+    return None
 
 
 def escape_markdown(text: str) -> str:
@@ -327,13 +361,15 @@ def main() -> None:
         for i in items:
             in_window = i["pub_date"] >= cutoff
             matched = is_error_fare(i)
+            skip = skip_reason(i) if matched else None
             already_sent = i["id"] in seen
             if args.verbose:
                 print(f"  [{'IN' if in_window else 'old'}] "
                       f"[{'MATCH' if matched else '  no  '}] "
                       f"[{'sent' if already_sent else 'new '}] "
-                      f"{i['pub_date'].strftime('%Y-%m-%d %H:%M UTC')}  {i['title']}")
-            if in_window and matched and not already_sent:
+                      f"{i['pub_date'].strftime('%Y-%m-%d %H:%M UTC')}  {i['title']}"
+                      + (f"  (skipped: {skip})" if skip else ""))
+            if in_window and matched and not skip and not already_sent:
                 qualifying.append(i)
 
     if not qualifying:

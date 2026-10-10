@@ -12,26 +12,38 @@ error fare.
 
 ```
 RSS feeds ─┐
-           ├─→ clean HTML ─→ match patterns ─→ drop duplicates ─→ Discord
-HTML pages ─┘                                  (seen.json)
+           ├─→ clean HTML ─→ match patterns ─→ skip expired / commentary ─→ drop duplicates ─→ Discord
+HTML pages ─┘                                                               (seen.json)
 ```
 
 Each run fetches every source, keeps posts published within `LOOKBACK_HOURS` (24h),
 and matches their title, summary and tags against a small set of error-fare patterns
 (`error fare`, `mistake fare`, `may not be honoured`, `book before it's fixed`, …).
 
-Anything matched is posted to Discord and recorded in `seen.json`, so a deal is never
+Two kinds of match are dropped before alerting: deals already marked **expired** (Secret
+Flying's `EXPIRED` stamp, or "expired" in the title), and **commentary** — items under a
+`/news/`, `/blog/`, `/lexikon/`, `/podcast/` or `/magazin/` URL section, which report
+*on* error fares and are never bookable. `--verbose` shows the reason next to a skipped
+match.
+
+Anything left is posted to Discord and recorded in `seen.json`, so a deal is never
 alerted twice even though the lookback window overlaps between runs.
 
 ## Sources
 
 | Source | Type | Notes |
 |---|---|---|
-| [Secret Flying](https://www.secretflying.com/) | HTML | The only source that labels error fares explicitly in the title |
+| [Secret Flying](https://www.secretflying.com/) | HTML | Labels error fares in the title and stamps them when expired |
 | [The Flight Deal](https://www.theflightdeal.com/) | RSS | US-focused; labels mistake fares in the title |
-| [Fly4Free](https://www.fly4free.com/) | RSS | European; heavily tagged |
+| [Fly4Free](https://www.fly4free.com/) | RSS | European; heavily tagged; mixes in `/news/` articles |
 | [Travelfree](https://travelfree.info/) | RSS | European |
 | [Fare Deal Alert](https://faredealalert.com/) | RSS | Low volume, pure airfare |
+| [Travel Dealz](https://travel-dealz.com/) | RSS | European; titles error fares `ERROR FARE:` and tags them `Error Fares` |
+| [Travel Dealz DE](https://travel-dealz.de/) | RSS | German edition; uses the English term "Error Fare" |
+
+Travel Dealz publishes an "Error Fares" tag feed, but it is always empty — deals are a
+custom WordPress post type that tag feeds do not include — so the main feeds are read,
+and their `/news/` and `/blog/` articles are dropped by the commentary filter.
 
 Secret Flying is read from HTML because Cloudflare returns 403 for its feed and category
 pages. Its `robots.txt` permits crawling at `Crawl-delay: 1` — one second between
@@ -44,6 +56,10 @@ Sites deliberately **not** included, and why:
   but are never bookable.
 - **Airfare Spot** — abandoned; newest post is from September 2023.
 - **r/flightdeals** — Atom, which `fetch_items` does not parse. Reddit also rate-limits.
+- **HolidayPirates, Urlaubspiraten, Wakacyjni Piraci, Fly4free.pl** — feeds work, but
+  they are package-holiday and hotel deals that do not label error fares.
+- **Loyalty Lobby, Head for Points** — loyalty-programme news and reviews, not deals.
+- **Jack's Flight Club, Going, Flynous** — no public feed (404/403).
 
 ## Setup
 
@@ -83,16 +99,17 @@ many runs observe it.
 ```bash
 python3 fare_monitor.py              # normal run, posts to Discord
 python3 fare_monitor.py --dry-run    # show what would be sent, post nothing
-python3 fare_monitor.py --verbose    # every item, with window / match / already-sent flags
+python3 fare_monitor.py --verbose    # every item, with window / match / already-sent flags and skip reasons
 ```
 
 `--verbose` is the one to reach for when the log says nothing was found and you want to
 know whether that is correct:
 
 ```
--- Secret Flying: fetched 11 item(s) --
-  [old] [MATCH] [new ] 2026-07-27 15:01 UTC  ⚠️ ERROR FARE ⚠️ Business Class Stockholm → Seoul
-  [IN]  [  no ] [new ] 2026-08-02 14:24 UTC  Non-stop Fort Lauderdale → San Juan, $178
+-- Secret Flying: fetched 6 item(s) --
+  [IN] [MATCH] [new ] 2026-10-10 09:12 UTC  ERROR FARE Business Class Stockholm to Seoul
+  [old] [MATCH] [sent] 2026-08-21 06:22 UTC  ERROR FARE Non-stop from Dublin to the USA  (skipped: expired)
+  [IN] [  no  ] [new ] 2026-10-10 08:40 UTC  Rome, Italy to Riyadh, Saudi Arabia for only €164
 ```
 
 ## State and failure handling
@@ -101,6 +118,9 @@ know whether that is correct:
 after 30 days. It is written **only after Discord accepts the message** — if the webhook
 fails the run exits non-zero and leaves state untouched, so the next run retries rather
 than silently dropping the deal.
+
+During pruning, timezone-naive timestamps are interpreted as UTC; invalid or non-string
+entries are discarded rather than aborting the run.
 
 Feed fetches retry three times with backoff. A source that fails is logged to stderr and
 skipped; the others still run.
@@ -111,7 +131,7 @@ skipped; the others still run.
 python3 -m unittest test_fare_monitor
 ```
 
-47 tests, no network, no dependencies beyond the standard library. Error fares are rare,
+55 tests, no network, no dependencies beyond the standard library. Error fares are rare,
 so a correct run and a broken run both print `No qualifying error fares found` — these
 cover the paths that only execute on the day it matters, including detection against real
 historical error-fare titles.
